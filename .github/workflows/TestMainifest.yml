@@ -1,0 +1,127 @@
+name: PR Manifest Test
+
+on:
+  pull_request:
+
+jobs:
+  get-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_files: ${{ steps.get-changes.outputs.result }}
+    steps:
+      - name: Get changed files
+        id: get-changes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number
+            });
+
+            const manifests = files
+              .map(f => f.filename)
+              .filter(name => name.endsWith('.json') && name.startsWith('bucket/'));
+
+            console.log(manifests);
+
+            return manifests;
+
+  test-manifests:
+    needs: get-changes
+    runs-on: windows-latest
+    if: ${{ fromJson(needs.get-changes.outputs.changed_files) != '' }}
+    strategy:
+      matrix:
+        manifest: ${{ fromJson(needs.get-changes.outputs.changed_files) }}
+        architecture: [64bit, 32bit, arm64]
+    steps:
+      - name: Show matrix
+        shell: powershell
+        run: |
+          Write-Host "Manifest: ${{ matrix.manifest }}"
+          Write-Host "Architecture: ${{ matrix.architecture }}"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          sparse-checkout: ${{ matrix.manifest }}
+          sparse-checkout-cone-mode: false
+
+      - name: Test architecture support
+        id: test_architecture_support
+        shell: powershell
+        run: |
+          $manifest = Get-Content '${{ matrix.manifest }}' -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+
+          if (-not $manifest) {
+            throw 'Failed to parse manifest: ${{ matrix.manifest }}'
+          }
+
+          $support = switch ('${{ matrix.architecture }}') {
+            '64bit' {$manifest.architecture -and $manifest.architecture.'64bit'}
+            '32bit' {($manifest.architecture -and $manifest.architecture.'32bit') -or $manifest.url}
+            'arm64' {$manifest.architecture -and $manifest.architecture.'arm64'}
+            default {throw "Unkonown architecture: ${{ matrix.architecture }}."}
+          }
+
+          Write-Host "Support ${{ matrix.architecture }}: $support."
+
+          "support=$(([bool]$support).ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+      - name: Install Scoop
+        if: ${{ steps.test_architecture_support.outputs.support == 'true' }}
+        shell: powershell
+        env:
+          MAX_RETRY_TIMES: 6
+          # SCOOP: 'D:\FirstName LastName'
+          SCOOP: 'D:\Scoop'
+        run: |
+          $ScoopCmdPath = [String]::Empty
+
+          for ($i = 0; $i -lt $Env:MAX_RETRY_TIMES; ++$i) {
+            try {
+              $f = Join-Path $env:USERPROFILE 'install.ps1'
+              Invoke-WebRequest 'https://raw.githubusercontent.com/ScoopInstaller/Install/master/install.ps1' -UseBasicParsing -OutFile $f
+              & $f -RunAsAdmin
+            } catch {
+              Write-Host "Exception occurred: $($_.Exception.Message)"
+            }
+
+            $ScoopCmdPath = (Get-Command scoop -CommandType Application -TotalCount 1 -ErrorAction Ignore).Source
+            if(-not [String]::IsNullOrEmpty($ScoopCmdPath)) {
+              break
+            }
+
+            Start-Sleep -Seconds (1 -shl $i)
+          }
+
+          if([String]::IsNullOrEmpty($ScoopCmdPath)) {
+            throw "Failed to install Scoop!"
+          }
+
+          if ($env:SCOOP_REPO) {
+            Write-Host "Switching to repository: ${env:SCOOP_REPO}"
+            scoop config scoop_repo $env:SCOOP_REPO
+            $needUpdate = $true
+          }
+          if ($env:SCOOP_BRANCH) {
+            Write-Host "Switching to branch: ${env:SCOOP_BRANCH}"
+            scoop config scoop_branch $env:SCOOP_BRANCH
+            $needUpdate = $true
+          }
+          if ($needUpdate) {
+            scoop update
+          }
+
+          $app = (Split-Path -Path ${{ matrix.manifest }} -Leaf) -Replace '.json$', ''
+
+          scoop bucket add test_bucket ${{ github.event.pull_request.head.repo.clone_url }}
+
+          scoop install test_bucket/$app -a ${{ matrix.architecture }} -u
+
+          scoop update test_bucket/$app -f -u
+
+          scoop uninstall test_bucket/$app -p
